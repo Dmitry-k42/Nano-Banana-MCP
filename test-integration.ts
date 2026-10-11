@@ -167,8 +167,9 @@ class IntegrationTester {
         'generate_image',
         'edit_image',
         'get_configuration_status',
+        'list_models',
         'GoogleGenerativeAI',
-        'gemini-2.5-flash-image-preview',
+        'gemini-nano-banana-2.1',
       ];
 
       for (const element of requiredElements) {

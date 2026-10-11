@@ -17,15 +17,11 @@ import fs from "fs/promises";
 import path from "path";
 import { config as dotenvConfig } from "dotenv";
 import os from "os";
+import { ConfigSchema, DEFAULT_MODEL } from "./config.js";
+import type { Config } from "./config.js";
 
 // Load environment variables
 dotenvConfig();
-
-const ConfigSchema = z.object({
-  geminiApiKey: z.string().min(1, "Gemini API key is required"),
-});
-
-type Config = z.infer<typeof ConfigSchema>;
 
 class NanoBananaMCP {
   private server: Server;
@@ -64,8 +60,21 @@ class NanoBananaMCP {
                   type: "string",
                   description: "Your Gemini API key from Google AI Studio",
                 },
+                model: {
+                  type: "string",
+                  description: `Optional Gemini model name for image generation (defaults to ${DEFAULT_MODEL})`,
+                },
               },
               required: ["apiKey"],
+            },
+          },
+          {
+            name: "list_models",
+            description: "List the Gemini model names available from Google's API, with their descriptions and capabilities",
+            inputSchema: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
             },
           },
           {
@@ -156,6 +165,9 @@ class NanoBananaMCP {
           case "configure_gemini_token":
             return await this.configureGeminiToken(request);
           
+          case "list_models":
+            return await this.listModels();
+          
           case "generate_image":
             return await this.generateImage(request);
           
@@ -184,12 +196,12 @@ class NanoBananaMCP {
   }
 
   private async configureGeminiToken(request: CallToolRequest): Promise<CallToolResult> {
-    const { apiKey } = request.params.arguments as { apiKey: string };
+    const { apiKey, model } = request.params.arguments as { apiKey: string; model?: string };
     
     try {
-      ConfigSchema.parse({ geminiApiKey: apiKey });
+      const config = ConfigSchema.parse({ geminiApiKey: apiKey, modelName: model });
       
-      this.config = { geminiApiKey: apiKey };
+      this.config = config;
       this.genAI = new GoogleGenAI({ apiKey });
       this.configSource = 'config_file'; // Manual configuration via tool
       
@@ -205,9 +217,79 @@ class NanoBananaMCP {
       };
     } catch (error) {
       if (error instanceof z.ZodError) {
-        throw new McpError(ErrorCode.InvalidParams, `Invalid API key: ${error.errors[0]?.message}`);
+        const issue = error.errors[0];
+        const field = issue?.path?.join(".") || "configuration";
+        throw new McpError(ErrorCode.InvalidParams, `Invalid ${field}: ${issue?.message}`);
       }
       throw error;
+    }
+  }
+
+  private async listModels(): Promise<CallToolResult> {
+    const current = this.config?.modelName ?? DEFAULT_MODEL;
+
+    if (!this.genAI) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Gemini API token not configured, so the live model list cannot be fetched.\n\nDefault model: ${DEFAULT_MODEL}\n\nConfigure the API key with configure_gemini_token, then call list_models again to fetch the available models from Google.`,
+          },
+        ],
+      };
+    }
+
+    try {
+      const pager = await this.genAI.models.list();
+      const models: Array<{ name: string; description?: string; actions: string[] }> = [];
+      for await (const model of pager) {
+        if (!model.name) {
+          continue;
+        }
+        models.push({
+          name: model.name.replace(/^models\//, ""),
+          description: model.description,
+          actions: model.supportedActions ?? [],
+        });
+      }
+
+      if (models.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No models returned by Google.\n\nDefault model: ${DEFAULT_MODEL}`,
+            },
+          ],
+        };
+      }
+
+      models.sort((a, b) => a.name.localeCompare(b.name));
+
+      const lines = models.map((m) => {
+        const marker = m.name === current ? " (current)" : "";
+        const desc = m.description ? ` - ${m.description}` : "";
+        const caps = m.actions.length > 0 ? `\n    Capabilities: ${m.actions.join(", ")}` : "";
+        return `- ${m.name}${marker}${desc}${caps}`;
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Available models (fetched from Google):\n${lines.join("\n")}\n\nCurrent model: ${current}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to fetch model list from Google: ${error instanceof Error ? error.message : String(error)}\n\nDefault model: ${DEFAULT_MODEL}`,
+          },
+        ],
+      };
     }
   }
 
@@ -220,7 +302,7 @@ class NanoBananaMCP {
     
     try {
       const response = await this.genAI!.models.generateContent({
-        model: "gemini-2.5-flash-image-preview",
+        model: this.config!.modelName,
         contents: prompt,
       });
       
@@ -265,7 +347,7 @@ class NanoBananaMCP {
       }
       
       // Build response content
-      let statusText = `🎨 Image generated with nano-banana (Gemini 2.5 Flash Image)!\n\nPrompt: "${prompt}"`;
+      let statusText = `🎨 Image generated with nano-banana (${this.config!.modelName})!\n\nPrompt: "${prompt}"`;
       
       if (textContent) {
         statusText += `\n\nDescription: ${textContent}`;
@@ -353,7 +435,7 @@ class NanoBananaMCP {
       
       // Use new API format with multiple images and text
       const response = await this.genAI!.models.generateContent({
-        model: "gemini-2.5-flash-image-preview",
+        model: this.config!.modelName,
         contents: [
           {
             parts: imageParts
@@ -455,7 +537,7 @@ class NanoBananaMCP {
           sourceInfo = "\n📍 Source: Environment variable (GEMINI_API_KEY)\n💡 This is the most secure configuration method.";
           break;
         case 'config_file':
-          sourceInfo = "\n📍 Source: Local configuration file (.nano-banana-config.json)\n💡 Consider using environment variables for better security.";
+          sourceInfo = "\n📍 Source: Local configuration file (.nano-banana-mcp/config.json)\n💡 Consider using environment variables for better security.";
           break;
       }
     } else {
@@ -573,31 +655,37 @@ class NanoBananaMCP {
     }
   }
 
-  private getImagesDirectory(): string {
+  private getOutputDirectory(): string {
     const platform = os.platform();
-    
+    const homeDir = os.homedir();
+    const cwd = process.cwd();
+
     if (platform === 'win32') {
       // Windows: Use Documents folder
-      const homeDir = os.homedir();
-      return path.join(homeDir, 'Documents', 'nano-banana-images');
-    } else {
-      // macOS/Linux: Use current directory or home directory if in system paths
-      const cwd = process.cwd();
-      const homeDir = os.homedir();
-      
-      // If in system directories, use home directory instead
-      if (cwd.startsWith('/usr/') || cwd.startsWith('/opt/') || cwd.startsWith('/var/')) {
-        return path.join(homeDir, 'nano-banana-images');
-      }
-      
-      return path.join(cwd, 'generated_imgs');
+      return path.join(homeDir, 'Documents', '.nano-banana-mcp');
     }
+
+    // If in system directories, use home directory instead
+    if (cwd.startsWith('/usr/') || cwd.startsWith('/opt/') || cwd.startsWith('/var/')) {
+      return path.join(homeDir, '.nano-banana-mcp');
+    }
+
+    return path.join(cwd, '.nano-banana-mcp');
+  }
+
+  private getImagesDirectory(): string {
+    return path.join(this.getOutputDirectory(), 'images');
+  }
+
+  private getConfigPath(): string {
+    return path.join(this.getOutputDirectory(), 'config.json');
   }
 
   private async saveConfig(): Promise<void> {
     if (this.config) {
-      const configPath = path.join(process.cwd(), '.nano-banana-config.json');
-      await fs.writeFile(configPath, JSON.stringify(this.config, null, 2));
+      const configPath = this.getConfigPath();
+      await fs.mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 });
+      await fs.writeFile(configPath, JSON.stringify(this.config, null, 2), { mode: 0o600 });
     }
   }
 
@@ -606,7 +694,10 @@ class NanoBananaMCP {
     const envApiKey = process.env.GEMINI_API_KEY;
     if (envApiKey) {
       try {
-        this.config = ConfigSchema.parse({ geminiApiKey: envApiKey });
+        this.config = ConfigSchema.parse({
+          geminiApiKey: envApiKey,
+          modelName: process.env.GEMINI_MODEL,
+        });
         this.genAI = new GoogleGenAI({ apiKey: this.config.geminiApiKey });
         this.configSource = 'environment';
         return;
@@ -617,7 +708,7 @@ class NanoBananaMCP {
     
     // Fallback to config file
     try {
-      const configPath = path.join(process.cwd(), '.nano-banana-config.json');
+      const configPath = this.getConfigPath();
       const configData = await fs.readFile(configPath, 'utf-8');
       const parsedConfig = JSON.parse(configData);
       
