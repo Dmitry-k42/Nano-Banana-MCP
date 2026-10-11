@@ -30,7 +30,7 @@ Thumbs.db
 .gitignore
 
 # Configuration files with sensitive data
-.nano-banana-config.json
+.nano-banana-mcp/
 
 # Test and coverage files
 coverage/
